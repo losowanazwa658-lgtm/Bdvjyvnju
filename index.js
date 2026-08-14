@@ -167,6 +167,3 @@ bot.launch().then(() => {
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
-```eof
-
-Just replace `index.js` in your GitHub repository with this code, commit the changes, and Railway will automatically re-deploy your updated bot!
