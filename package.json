@@ -1,0 +1,16 @@
+{
+  "name": "telegram-group-referral-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot generating custom Group X invite links and single-use Group Y access links",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.8.0",
+    "telegraf": "^4.16.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
