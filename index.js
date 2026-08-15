@@ -4,10 +4,9 @@ const path = require('path');
 
 // Load environment variables
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const GROUP_X_ID = process.env.GROUP_X_ID; // "Link Sharin'" Group ID (e.g. -1004350125558)
-const GROUP_Y_ID = process.env.GROUP_Y_ID; // "Secret Paradise" Group ID (e.g. -1005055526739)
+const GROUP_X_ID = process.env.GROUP_X_ID; // "Link Sharin'" Group ID
+const GROUP_Y_ID = process.env.GROUP_Y_ID; // "Secret Paradise" Group ID
 const REQUIRED_INVITES = parseInt(process.env.REQUIRED_INVITES || '1', 10);
-// Announcement thread/topic ID from https://t.me/c/4350125558/400
 const ANNOUNCEMENT_THREAD_ID = parseInt(process.env.ANNOUNCEMENT_THREAD_ID || '400', 10);
 
 if (!BOT_TOKEN || !GROUP_X_ID || !GROUP_Y_ID) {
@@ -42,7 +41,7 @@ const linkOwnerStmt = db.prepare('INSERT OR REPLACE INTO link_owners (invite_lin
 const getOwnerByLinkStmt = db.prepare('SELECT owner_id FROM link_owners WHERE invite_link = ?');
 const incrementInviteStmt = db.prepare('UPDATE users SET invites_count = invites_count + 1 WHERE user_id = ?');
 const setRewardedStmt = db.prepare('UPDATE users SET rewarded = 1 WHERE user_id = ?');
-const getInvitesStmt = db.prepare('SELECT invites_count, rewarded FROM users WHERE user_id = ?');
+const resetUserStmt = db.prepare('UPDATE users SET invites_count = 0, rewarded = 0 WHERE user_id = ?');
 
 // Helper to safely escape HTML special characters
 function escapeHtml(text) {
@@ -53,7 +52,7 @@ function escapeHtml(text) {
     .replace(/>/g, '&gt;');
 }
 
-// 1. /start command - generate unique referral link for "Link Sharin'"
+// 1. /start command
 bot.start(async (ctx) => {
   const userId = ctx.from.id;
   let user = getUserStmt.get(userId);
@@ -68,6 +67,7 @@ bot.start(async (ctx) => {
 
       saveUserLinkStmt.run(userId, inviteLink);
       linkOwnerStmt.run(inviteLink, userId);
+      user = getUserStmt.get(userId);
     } catch (err) {
       console.error("Error creating chat invite link for Link Sharin':", err);
       return ctx.reply('⚠️ Error generating invite link. Make sure the bot is an Admin in "Link Sharin\'" with "Invite Users via Link" permission!');
@@ -88,7 +88,7 @@ bot.start(async (ctx) => {
   );
 });
 
-// 2. /status & /progress commands
+// 2. /status & /progress
 bot.command(['status', 'progress'], async (ctx) => {
   const userId = ctx.from.id;
   const user = getUserStmt.get(userId);
@@ -103,12 +103,18 @@ bot.command(['status', 'progress'], async (ctx) => {
   );
 });
 
-// 3. Reaction to new member joining "Link Sharin'" via link
+// 3. /resetme command (Do testowania)
+bot.command('resetme', async (ctx) => {
+  const userId = ctx.from.id;
+  resetUserStmt.run(userId);
+  await ctx.reply('🔄 Your invite progress and reward status have been reset! Type /start to see your clean progress.');
+});
+
+// 4. Reaction to new member joining "Link Sharin'" via link
 bot.on('chat_member', async (ctx) => {
   const chatMember = ctx.chatMember;
   const chatId = ctx.chat.id.toString();
 
-  // Check if event comes from "Link Sharin'" and new status is "member"
   if (chatId === GROUP_X_ID.toString() && chatMember.new_chat_member.status === 'member') {
     const usedLink = chatMember.invite_link ? chatMember.invite_link.invite_link : null;
 
@@ -119,13 +125,14 @@ bot.on('chat_member', async (ctx) => {
         const referrerId = owner.owner_id;
         incrementInviteStmt.run(referrerId);
 
-        const userRecord = getInvitesStmt.get(referrerId);
+        const userRecord = getUserStmt.get(referrerId);
         const currentInvites = userRecord ? userRecord.invites_count : 0;
         const alreadyRewarded = userRecord ? userRecord.rewarded : 0;
 
         console.log(`New user joined Link Sharin' via link owned by ${referrerId}. Total invites: ${currentInvites}`);
 
         try {
+          // If the user hasn't met the quota yet
           if (currentInvites < REQUIRED_INVITES) {
             const remaining = REQUIRED_INVITES - currentInvites;
             await ctx.telegram.sendMessage(
@@ -136,72 +143,71 @@ bot.on('chat_member', async (ctx) => {
               `Invite <b>${remaining} more ${remaining === 1 ? 'person' : 'people'}</b> to get your link to Secret Paradise!`,
               { parse_mode: 'HTML' }
             );
-          } else {
-            // Target number of invites reached!
-            if (!alreadyRewarded) {
-              setRewardedStmt.run(referrerId);
+          } 
+          // Reached or exceeded required invites
+          else if (!alreadyRewarded) {
+            setRewardedStmt.run(referrerId);
 
-              // Generate single-use invite link for Secret Paradise (member_limit = 1)
-              const groupYInvite = await ctx.telegram.createChatInviteLink(GROUP_Y_ID, {
-                member_limit: 1,
-                expire_date: Math.floor(Date.now() / 1000) + 86400 // Valid for 24 hours
-              });
+            // Generate single-use invite link for Secret Paradise
+            const groupYInvite = await ctx.telegram.createChatInviteLink(GROUP_Y_ID, {
+              member_limit: 1,
+              expire_date: Math.floor(Date.now() / 1000) + 86400
+            });
 
-              // Private message to the referrer with access link
-              await ctx.telegram.sendMessage(
-                referrerId,
-                `🏆 <b>GOAL REACHED! (${currentInvites}/${REQUIRED_INVITES})</b>\n\n` +
-                `Congratulations! You have successfully invited ${REQUIRED_INVITES} ${REQUIRED_INVITES === 1 ? 'person' : 'people'} to Link Sharin'.\n\n` +
-                `Here is your <b>single-use</b> access link to <b>Secret Paradise</b>:\n` +
-                `🔗 <code>${groupYInvite.invite_link}</code>\n\n` +
-                `<i>(Note: This link can only be used ONCE. After you click and join, it self-destructs!)</i>`,
-                { parse_mode: 'HTML' }
-              );
+            // Send private message to referrer
+            await ctx.telegram.sendMessage(
+              referrerId,
+              `🏆 <b>GOAL REACHED! (${currentInvites}/${REQUIRED_INVITES})</b>\n\n` +
+              `Congratulations! You have successfully invited ${REQUIRED_INVITES} ${REQUIRED_INVITES === 1 ? 'person' : 'people'} to Link Sharin'.\n\n` +
+              `Here is your <b>single-use</b> access link to <b>Secret Paradise</b>:\n` +
+              `🔗 <code>${groupYInvite.invite_link}</code>\n\n` +
+              `<i>(Note: This link can only be used ONCE. After you click and join, it self-destructs!)</i>`,
+              { parse_mode: 'HTML' }
+            );
 
-              // Get referrer details to announce publicly
-              let referrerDisplayName = `user ${referrerId}`;
-              try {
-                const memberInfo = await ctx.telegram.getChatMember(GROUP_X_ID, referrerId);
-                if (memberInfo && memberInfo.user) {
-                  referrerDisplayName = memberInfo.user.username 
-                    ? `@${memberInfo.user.username}` 
-                    : escapeHtml(memberInfo.user.first_name);
-                }
-              } catch (e) {
-                console.error("Could not fetch referrer details for announcement:", e.message);
+            // Fetch user info for topic announcement
+            let referrerDisplayName = `user ${referrerId}`;
+            try {
+              const memberInfo = await ctx.telegram.getChatMember(GROUP_X_ID, referrerId);
+              if (memberInfo && memberInfo.user) {
+                referrerDisplayName = memberInfo.user.username 
+                  ? `@${memberInfo.user.username}` 
+                  : escapeHtml(memberInfo.user.first_name);
               }
-
-              const botUsername = ctx.botInfo.username;
-
-              // Send public announcement to topic thread 400 in Link Sharin'
-              await ctx.telegram.sendMessage(
-                GROUP_X_ID,
-                `user <b>${referrerDisplayName}</b> invited ${REQUIRED_INVITES} ${REQUIRED_INVITES === 1 ? 'person' : 'people'} and unlocked the secret channel\n\n` +
-                `👉 https://t.me/${botUsername}`,
-                { 
-                  parse_mode: 'HTML',
-                  message_thread_id: ANNOUNCEMENT_THREAD_ID 
-                }
-              );
-
-            } else {
-              // Referrer already received the reward before
-              await ctx.telegram.sendMessage(
-                referrerId,
-                `🎉 Someone else joined using your link!\n` +
-                `📊 <b>Total Invites:</b> ${currentInvites}`
-              );
+            } catch (e) {
+              console.error("Could not fetch referrer details for announcement:", e.message);
             }
+
+            const botUsername = ctx.botInfo.username;
+
+            // Post public announcement in topic 400
+            await ctx.telegram.sendMessage(
+              GROUP_X_ID,
+              `user <b>${referrerDisplayName}</b> invited ${REQUIRED_INVITES} ${REQUIRED_INVITES === 1 ? 'person' : 'people'} and unlocked the secret channel\n\n` +
+              `👉 https://t.me/${botUsername}`,
+              { 
+                parse_mode: 'HTML',
+                message_thread_id: ANNOUNCEMENT_THREAD_ID 
+              }
+            );
+          } 
+          // User already got rewarded previously
+          else {
+            await ctx.telegram.sendMessage(
+              referrerId,
+              `🎉 Someone else joined using your link!\n` +
+              `📊 <b>Total Invites:</b> ${currentInvites}`,
+              { parse_mode: 'HTML' }
+            );
           }
         } catch (err) {
-          console.error('Failed to notify referrer or send announcement:', err.message);
+          console.error('Failed to process invite event:', err.message);
         }
       }
     }
   }
 });
 
-// Enable receiving `chat_member` updates
 bot.launch({
   allowedUpdates: ['message', 'chat_member']
 }).then(() => {
