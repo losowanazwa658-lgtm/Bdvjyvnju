@@ -7,6 +7,8 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const GROUP_X_ID = process.env.GROUP_X_ID; // ID Grupy X (np. -1004350125558)
 const GROUP_Y_ID = process.env.GROUP_Y_ID; // ID Grupy Y (np. -1005055526739)
 const REQUIRED_INVITES = parseInt(process.env.REQUIRED_INVITES || '5', 10);
+// ID wątku/topicu z linku https://t.me/c/4350125558/400
+const ANNOUNCEMENT_THREAD_ID = parseInt(process.env.ANNOUNCEMENT_THREAD_ID || '400', 10);
 
 if (!BOT_TOKEN || !GROUP_X_ID || !GROUP_Y_ID) {
   console.error('ERROR: Missing BOT_TOKEN, GROUP_X_ID, or GROUP_Y_ID in environment variables!');
@@ -145,6 +147,7 @@ bot.on('chat_member', async (ctx) => {
                 expire_date: Math.floor(Date.now() / 1000) + 86400 // Ważne przez 24 godz.
               });
 
+              // Send private notification & link to the referrer
               await ctx.telegram.sendMessage(
                 referrerId,
                 `🏆 <b>GOAL REACHED! (${currentInvites}/${REQUIRED_INVITES})</b>\n\n` +
@@ -154,6 +157,33 @@ bot.on('chat_member', async (ctx) => {
                 `<i>(Note: This link can only be used ONCE. After you click and join, it self-destructs!)</i>`,
                 { parse_mode: 'HTML' }
               );
+
+              // Pobranie danych zapraszającego użytkownika do oznaczenia w ogłoszeniu publicznym
+              let referrerDisplayName = `User ${referrerId}`;
+              try {
+                const memberInfo = await ctx.telegram.getChatMember(GROUP_X_ID, referrerId);
+                if (memberInfo && memberInfo.user) {
+                  referrerDisplayName = memberInfo.user.username 
+                    ? `@${memberInfo.user.username}` 
+                    : escapeHtml(memberInfo.user.first_name);
+                }
+              } catch (e) {
+                console.error("Could not fetch referrer details for announcement:", e.message);
+              }
+
+              const botUsername = ctx.botInfo.username;
+
+              // Wysyłka wiadomości publicznej na wybrany wątek (Topic ID: 400)
+              await ctx.telegram.sendMessage(
+                GROUP_X_ID,
+                `🎉 <b>${referrerDisplayName}</b> invited ${REQUIRED_INVITES} ${REQUIRED_INVITES === 1 ? 'person' : 'people'} and unlocked the secret channel!\n\n` +
+                `👉 Want to unlock it too? Get your invite link here: https://t.me/${botUsername}`,
+                { 
+                  parse_mode: 'HTML',
+                  message_thread_id: ANNOUNCEMENT_THREAD_ID 
+                }
+              );
+
             } else {
               // Użytkownik już dostał nagrodę wcześniej
               await ctx.telegram.sendMessage(
@@ -164,7 +194,7 @@ bot.on('chat_member', async (ctx) => {
             }
           }
         } catch (err) {
-          console.error('Failed to notify referrer:', err.message);
+          console.error('Failed to notify referrer or send announcement:', err.message);
         }
       }
     }
