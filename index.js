@@ -1,6 +1,13 @@
 const { Telegraf } = require('telegraf');
 const Database = require('better-sqlite3');
 const path = require('path');
+const fs = require('fs');
+
+// Ensure data directory exists (for Railway persistent volume, e.g., /data)
+const dataDir = process.env.DATA_DIR || __dirname;
+if (!fs.existsSync(dataDir)) {
+  fs.mkdirSync(dataDir, { recursive: true });
+}
 
 // Load environment variables
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -16,8 +23,8 @@ if (!BOT_TOKEN || !GROUP_X_ID || !GROUP_Y_ID) {
 
 const bot = new Telegraf(BOT_TOKEN);
 
-// Initialize SQLite database
-const db = new Database(path.join(__dirname, 'referrals.db'));
+// Initialize SQLite database in dataDir
+const db = new Database(path.join(dataDir, 'referrals.db'));
 
 // Create database tables
 db.exec(`
@@ -32,6 +39,11 @@ db.exec(`
     invite_link TEXT PRIMARY KEY,
     owner_id INTEGER
   );
+
+  CREATE TABLE IF NOT EXISTS joined_members (
+    joined_user_id INTEGER PRIMARY KEY,
+    referrer_id INTEGER
+  );
 `);
 
 // Prepared SQL statements
@@ -43,6 +55,9 @@ const incrementInviteStmt = db.prepare('UPDATE users SET invites_count = invites
 const setRewardedStmt = db.prepare('UPDATE users SET rewarded = 1 WHERE user_id = ?');
 const resetUserStmt = db.prepare('UPDATE users SET invites_count = 0, rewarded = 0 WHERE user_id = ?');
 
+const isUserJoinedStmt = db.prepare('SELECT 1 FROM joined_members WHERE joined_user_id = ?');
+const recordJoinedUserStmt = db.prepare('INSERT INTO joined_members (joined_user_id, referrer_id) VALUES (?, ?)');
+
 // Helper to safely escape HTML special characters
 function escapeHtml(text) {
   if (!text) return '';
@@ -50,6 +65,19 @@ function escapeHtml(text) {
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
+}
+
+// Helper to handle Telegram 403 error (if a user blocked the bot)
+async function safeSendMessage(telegram, chatId, text, options = {}) {
+  try {
+    return await telegram.sendMessage(chatId, text, options);
+  } catch (err) {
+    if (err.response && err.response.error_code === 403) {
+      console.log(`[INF] Cannot send message to ${chatId}: User blocked the bot.`);
+    } else {
+      console.error(`[ERR] Failed to send message to ${chatId}:`, err.message);
+    }
+  }
 }
 
 // 1. /start command
@@ -83,12 +111,12 @@ bot.start(async (ctx) => {
     `🔗 <code>${inviteLink}</code>\n\n` +
     `📊 <b>Progress:</b> ${invitesCount}/${REQUIRED_INVITES} members invited\n\n` +
     `Share this link! Every time someone joins <b>Link Sharin'</b> using your link, I will send you a progress update.\n` +
-    `Once you reach <b>${REQUIRED_INVITES} invite${REQUIRED_INVITES === 1 ? '' : 's'}</b>, I will send you your personal single-use link to <b>Secret Paradise</b>!`,
+    `Once you reach <b>${REQUIRED_INVITES} invite${REQUIRED_INVITES === 1 ? '' : 's'}</b>, I will send you your personal <b>single-use</b> link to <b>Secret Paradise</b>!`,
     { parse_mode: 'HTML' }
   );
 });
 
-// 2. /status & /progress
+// 2. /status & /progress commands
 bot.command(['status', 'progress'], async (ctx) => {
   const userId = ctx.from.id;
   const user = getUserStmt.get(userId);
@@ -103,7 +131,7 @@ bot.command(['status', 'progress'], async (ctx) => {
   );
 });
 
-// 3. /resetme command (Do testowania)
+// 3. /resetme command (For testing)
 bot.command('resetme', async (ctx) => {
   const userId = ctx.from.id;
   resetUserStmt.run(userId);
@@ -116,6 +144,7 @@ bot.on('chat_member', async (ctx) => {
   const chatId = ctx.chat.id.toString();
 
   if (chatId === GROUP_X_ID.toString() && chatMember.new_chat_member.status === 'member') {
+    const joinedUserId = chatMember.new_chat_member.user.id;
     const usedLink = chatMember.invite_link ? chatMember.invite_link.invite_link : null;
 
     if (usedLink) {
@@ -123,19 +152,33 @@ bot.on('chat_member', async (ctx) => {
 
       if (owner) {
         const referrerId = owner.owner_id;
+
+        // Prevent users from using their own referral link
+        if (joinedUserId === referrerId) return;
+
+        // Prevent re-joins from counting multiple times (anti-cheat)
+        const alreadyJoined = isUserJoinedStmt.get(joinedUserId);
+        if (alreadyJoined) {
+          console.log(`[INF] User ${joinedUserId} rejoined. Invite ignored.`);
+          return;
+        }
+
+        // Record unique join and increment referrer counter
+        recordJoinedUserStmt.run(joinedUserId, referrerId);
         incrementInviteStmt.run(referrerId);
 
         const userRecord = getUserStmt.get(referrerId);
         const currentInvites = userRecord ? userRecord.invites_count : 0;
         const alreadyRewarded = userRecord ? userRecord.rewarded : 0;
 
-        console.log(`New user joined Link Sharin' via link owned by ${referrerId}. Total invites: ${currentInvites}`);
+        console.log(`[INF] New user joined Link Sharin' via link owned by ${referrerId}. Total invites: ${currentInvites}`);
 
         try {
           // If the user hasn't met the quota yet
           if (currentInvites < REQUIRED_INVITES) {
             const remaining = REQUIRED_INVITES - currentInvites;
-            await ctx.telegram.sendMessage(
+            await safeSendMessage(
+              ctx.telegram,
               referrerId,
               `🎉 <b>New Invite Detected!</b>\n\n` +
               `Someone just joined Link Sharin' using your link!\n` +
@@ -144,18 +187,19 @@ bot.on('chat_member', async (ctx) => {
               { parse_mode: 'HTML' }
             );
           } 
-          // Reached or exceeded required invites
+          // Reached required invites and hasn't been rewarded yet
           else if (!alreadyRewarded) {
             setRewardedStmt.run(referrerId);
 
-            // Generate single-use invite link for Secret Paradise
+            // Generate SINGLE-USE invite link for Secret Paradise (member_limit: 1)
             const groupYInvite = await ctx.telegram.createChatInviteLink(GROUP_Y_ID, {
               member_limit: 1,
-              expire_date: Math.floor(Date.now() / 1000) + 86400
+              expire_date: Math.floor(Date.now() / 1000) + 86400 // Expires in 24 hours
             });
 
-            // Send private message to referrer
-            await ctx.telegram.sendMessage(
+            // Send single-use link to referrer
+            await safeSendMessage(
+              ctx.telegram,
               referrerId,
               `🏆 <b>GOAL REACHED! (${currentInvites}/${REQUIRED_INVITES})</b>\n\n` +
               `Congratulations! You have successfully invited ${REQUIRED_INVITES} ${REQUIRED_INVITES === 1 ? 'person' : 'people'} to Link Sharin'.\n\n` +
@@ -181,7 +225,8 @@ bot.on('chat_member', async (ctx) => {
             const botUsername = ctx.botInfo.username;
 
             // Post public announcement in topic 400
-            await ctx.telegram.sendMessage(
+            await safeSendMessage(
+              ctx.telegram,
               GROUP_X_ID,
               `user <b>${referrerDisplayName}</b> invited ${REQUIRED_INVITES} ${REQUIRED_INVITES === 1 ? 'person' : 'people'} and unlocked the secret channel\n\n` +
               `👉 https://t.me/${botUsername}`,
@@ -193,7 +238,8 @@ bot.on('chat_member', async (ctx) => {
           } 
           // User already got rewarded previously
           else {
-            await ctx.telegram.sendMessage(
+            await safeSendMessage(
+              ctx.telegram,
               referrerId,
               `🎉 Someone else joined using your link!\n` +
               `📊 <b>Total Invites:</b> ${currentInvites}`,
